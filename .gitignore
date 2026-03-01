@@ -1,0 +1,31 @@
+# Compiled binaries
+tpms_matan
+tpms_spatial
+*.o
+*.out
+*.bak
+
+# Generated/output data
+tpms_models/
+complimentary/
+output/
+vtk/
+tetrahedral/
+simulation_tests/
+
+# Input meshes (too large for git)
+models/
+
+# External libraries
+libigl/
+
+# Temporary files
+*.geo.tmp
+temp_convert.geo
+
+# OS files
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
