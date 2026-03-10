@@ -1,0 +1,8 @@
+# Ignore everything
+*
+
+# Track code files
+!*.cpp
+!*.py
+!makefile
+!.gitignore
