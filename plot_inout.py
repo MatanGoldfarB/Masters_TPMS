@@ -44,6 +44,7 @@ def main():
     print(f"Loading {ply_path}...")
     points, colors = load_ply(ply_path)
     print(f"Loaded {len(points)} points")
+    print()
 
     # Load input mesh for overlay
     mesh_verts, mesh_faces = None, None
