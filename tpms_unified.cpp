@@ -168,8 +168,10 @@ void generate(const std::string& input_path, const std::string& output_path)
 		return;
 	}
 
-	// Write 80-byte header
+	// Write 80-byte header with metadata
 	char header[80] = {};
+	snprintf(header, 80, "type=%d res=%.4g thick=%.4g cells=%.4g",
+	         tpms_input, resolution, thickness, n_cells);
 	fwrite(header, 1, 80, stl_fp);
 	// Write placeholder triangle count (will patch later)
 	uint32_t total_triangles = 0;
