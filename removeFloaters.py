@@ -17,19 +17,15 @@ def keep_largest_component(in_path: str, out_path: str) -> None:
     if len(parts) == 0:
         raise ValueError("No components found.")
 
-    # Pick the largest component.
-    # If watertight -> volume is meaningful; otherwise fall back to face count/area.
+    # Pick the largest component by face count (most robust for both solid and sheet meshes).
     def score(m: trimesh.Trimesh) -> float:
-        if m.is_watertight:
-            return abs(m.volume)
-        # robust fallback:
-        return float(m.faces.shape[0])  # or m.area
+        return float(m.faces.shape[0])
 
     largest = max(parts, key=score)
 
     # Optional: clean up
     largest.remove_unreferenced_vertices()
-    largest.remove_degenerate_faces()
+    # largest.remove_degenerate_faces()  # skip — too aggressive on thin TPMS sheets
 
     largest.export(out_path)
     print(f"Components: {len(parts)} | Kept faces: {largest.faces.shape[0]} | Wrote: {out_path}")
