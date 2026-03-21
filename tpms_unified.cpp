@@ -12,7 +12,9 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <vector>
 #include <cmath>
 #include <algorithm>
 #include <Eigen/Geometry>
@@ -25,7 +27,116 @@ typedef CGAL::AABB_face_graph_triangle_primitive<SurfaceMesh> Primitive;
 typedef CGAL::AABB_traits_3<K, Primitive> AABB_traits;
 typedef CGAL::AABB_tree<AABB_traits> Tree;
 
-enum TpmsType { kP = 0, kD = 1, kG = 2 };
+enum TpmsType { kP = 0, kD = 1, kG = 2, kSteppedOmega = 3, kInterpolatedOmega = 4 };
+
+struct SteppedZone {
+	double omega;
+	double thickness;
+	double boundary_d;        // cumulative distance from surface where this zone ends
+};
+
+struct SteppedOmegaParams {
+	TpmsType base_type;
+	std::vector<SteppedZone> zones;  // ordered from surface inward; last zone extends to infinity
+};
+
+struct ControlPoint {
+	double x, y, z;
+	double n_cells;
+	double thickness;
+};
+
+struct InterpolatedOmegaParams {
+	TpmsType base_type;
+	std::vector<ControlPoint> points;
+};
+
+// Smooth interpolation [0,1] with zero derivative at endpoints
+static double smoothstep(double edge0, double edge1, double x)
+{
+	if (edge1 <= edge0) return (x < edge0) ? 0.0 : 1.0;
+	double t = std::clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+	return t * t * (3.0 - 2.0 * t);
+}
+
+// For N-zone stepped omega: find the two zones that bracket distance d and compute blend.
+// Sets idx_a, idx_b (zone indices) and alpha (1.0 = purely zone idx_a, 0.0 = purely zone idx_b).
+// When d is fully inside one zone (not in a transition), idx_a == idx_b and alpha == 1.0.
+static void stepped_find_zones(double d, const SteppedOmegaParams& p,
+	int& idx_a, int& idx_b, double& alpha)
+{
+	const auto& zones = p.zones;
+	int n = static_cast<int>(zones.size());
+
+	// Find which zone d falls into (or which transition)
+	for (int i = 0; i < n - 1; i++) {
+		double boundary = zones[i].boundary_d;
+		// Transition width = 1 wavelength of the slower (lower omega) adjacent zone
+		double tw = std::max(2.0 * M_PI / zones[i].omega, 2.0 * M_PI / zones[i+1].omega);
+		double blend_start = boundary;
+		double blend_end   = boundary + tw;
+
+		if (d < blend_start) {
+			// Fully inside zone i
+			idx_a = i; idx_b = i; alpha = 1.0;
+			return;
+		}
+		if (d <= blend_end) {
+			// In transition between zone i and zone i+1
+			idx_a = i; idx_b = i + 1;
+			alpha = 1.0 - smoothstep(blend_start, blend_end, d);
+			return;
+		}
+	}
+	// Past all boundaries → last zone
+	idx_a = n - 1; idx_b = n - 1; alpha = 1.0;
+}
+
+// IDW interpolation of omega and thickness from control points.
+// Returns {local_omega, local_thickness}.
+static std::pair<double, double> idw_interpolate(
+	double x, double y, double z,
+	const std::vector<ControlPoint>& pts, double max_dim)
+{
+	double w_sum = 0.0, omega_sum = 0.0, thick_sum = 0.0;
+	for (const auto& p : pts) {
+		double dx = x - p.x, dy = y - p.y, dz = z - p.z;
+		double dist2 = dx*dx + dy*dy + dz*dz;
+		if (dist2 < 1e-12) {
+			// Coincident with control point
+			double omega = p.n_cells * 2.0 * M_PI / max_dim;
+			return {omega, p.thickness};
+		}
+		double w = 1.0 / dist2;
+		omega_sum += w * (p.n_cells * 2.0 * M_PI / max_dim);
+		thick_sum += w * p.thickness;
+		w_sum += w;
+	}
+	return {omega_sum / w_sum, thick_sum / w_sum};
+}
+
+// Parse control points file. Format: one point per line, columns: n_cells x y z thickness
+// Lines starting with # are comments. Returns empty vector on failure.
+static std::vector<ControlPoint> parse_control_points(const std::string& path)
+{
+	std::vector<ControlPoint> pts;
+	std::ifstream fin(path);
+	if (!fin) {
+		std::cerr << "Error: could not open control points file: " << path << std::endl;
+		return pts;
+	}
+	std::string line;
+	while (std::getline(fin, line)) {
+		if (line.empty() || line[0] == '#') continue;
+		std::istringstream iss(line);
+		ControlPoint cp;
+		if (iss >> cp.n_cells >> cp.x >> cp.y >> cp.z >> cp.thickness) {
+			pts.push_back(cp);
+		}
+	}
+	std::cout << "  Loaded " << pts.size() << " control points from " << path << std::endl;
+	return pts;
+}
 
 double tpms_function(TpmsType type, double omega, double x, double y, double z)
 {
@@ -39,6 +150,8 @@ double tpms_function(TpmsType type, double omega, double x, double y, double z)
 		return sin(omega * x) * cos(omega * y)
 		     + sin(omega * y) * cos(omega * z)
 		     + sin(omega * z) * cos(omega * x);
+	default:
+		break;
 	}
 	return 0.0;
 }
@@ -105,14 +218,31 @@ void generate(const std::string& input_path, const std::string& output_path)
 	std::cout << "  Z: [" << zmin << ", " << zmax << "]  (" << zgap << ")" << std::endl;
 
 	// --- Interactive parameters ---
-	std::cout << "Input TPMS type (0=kP, 1=kD, 2=kG): ";
+	std::cout << "Input TPMS type (0=kP, 1=kD, 2=kG, 3=SteppedOmega, 4=InterpolatedOmega): ";
 	int tpms_input;
 	std::cin >> tpms_input;
-	if (tpms_input < 0 || tpms_input > 2) {
+	if (tpms_input < 0 || tpms_input > 4) {
 		std::cerr << "Error: invalid TPMS type" << std::endl;
 		return;
 	}
 	TpmsType tpms_type = static_cast<TpmsType>(tpms_input);
+
+	// Parameters for new types (populated below if needed)
+	SteppedOmegaParams stepped_params = {};
+	InterpolatedOmegaParams interp_params = {};
+
+	// Base type for stepped/interpolated modes
+	TpmsType base_type = tpms_type;  // for kP/kD/kG, base_type == tpms_type
+	if (tpms_type == kSteppedOmega || tpms_type == kInterpolatedOmega) {
+		std::cout << "Input base TPMS type (0=kP, 1=kD, 2=kG): ";
+		int base_input;
+		std::cin >> base_input;
+		if (base_input < 0 || base_input > 2) {
+			std::cerr << "Error: invalid base TPMS type" << std::endl;
+			return;
+		}
+		base_type = static_cast<TpmsType>(base_input);
+	}
 
 	std::cout << "Input resolution multiplier (voxels per unit length): ";
 	double resolution;
@@ -126,19 +256,89 @@ void generate(const std::string& input_path, const std::string& output_path)
 	std::cout << "  Grid: " << x_num << " x " << y_num << " x " << z_num
 	          << " = " << (long long)x_num * y_num * z_num << " voxels" << std::endl;
 
-	std::cout << "Input wall thickness (full thickness in model units): ";
-	double thickness;
-	std::cin >> thickness;
+	// Global omega parameters (used by kP/kD/kG)
+	double thickness = 0.0, n_cells = 0.0;
+	double omega = 0.0, half_t = 0.0, smf = 1.0;
 
-	std::cout << "Input number of unit cells: ";
-	double n_cells;
-	std::cin >> n_cells;
-	double omega = n_cells * 2.0 * M_PI / max_dim;
-	std::cout << "  omega = " << omega << std::endl;
+	if (tpms_type == kP || tpms_type == kD || tpms_type == kG) {
+		std::cout << "Input wall thickness (full thickness in model units): ";
+		std::cin >> thickness;
 
-	double half_t = (thickness / 2.0) * omega;
-	double wavelength = 2.0 * M_PI / omega;
-	double smf = wavelength / 10.0;
+		std::cout << "Input number of unit cells: ";
+		std::cin >> n_cells;
+		omega = n_cells * 2.0 * M_PI / max_dim;
+		std::cout << "  omega = " << omega << std::endl;
+
+		half_t = (thickness / 2.0) * omega;
+		double wavelength = 2.0 * M_PI / omega;
+		smf = wavelength / 10.0;
+	}
+
+	// --- Stepped omega: N-zone loop ---
+	if (tpms_type == kSteppedOmega) {
+		stepped_params.base_type = base_type;
+		double cumulative_d = 0.0;
+		int zone_num = 1;
+
+		while (true) {
+			std::cout << "Zone " << zone_num << ":" << std::endl;
+
+			std::cout << "  n_cells: ";
+			double zn;
+			std::cin >> zn;
+
+			std::cout << "  thickness: ";
+			double zt;
+			std::cin >> zt;
+
+			double z_omega = zn * 2.0 * M_PI / max_dim;
+			double z_lambda = 2.0 * M_PI / z_omega;
+
+			std::cout << "  cycles before next zone (0 = last zone): ";
+			double n_cycles;
+			std::cin >> n_cycles;
+
+			if (n_cycles <= 0.0) {
+				// Last zone — extends to infinity
+				SteppedZone zone;
+				zone.omega = z_omega;
+				zone.thickness = zt;
+				zone.boundary_d = 1e10;  // effectively infinite
+				stepped_params.zones.push_back(zone);
+				std::cout << "  Zone " << zone_num << ": omega=" << z_omega
+				          << ", thickness=" << zt << " [final zone]" << std::endl;
+				break;
+			}
+
+			cumulative_d += n_cycles * z_lambda;
+
+			SteppedZone zone;
+			zone.omega = z_omega;
+			zone.thickness = zt;
+			zone.boundary_d = cumulative_d;
+			stepped_params.zones.push_back(zone);
+
+			std::cout << "  Zone " << zone_num << ": omega=" << z_omega
+			          << ", thickness=" << zt
+			          << ", boundary_d=" << cumulative_d << std::endl;
+			zone_num++;
+		}
+
+		std::cout << "  Total zones: " << stepped_params.zones.size() << std::endl;
+	}
+
+	// --- Interpolated omega: load control points from file ---
+	std::string cp_path;
+	if (tpms_type == kInterpolatedOmega) {
+		interp_params.base_type = base_type;
+		std::cout << "Input control points file path: ";
+		std::cin >> cp_path;
+		interp_params.points = parse_control_points(cp_path);
+		if (interp_params.points.empty()) {
+			std::cerr << "Error: no control points loaded" << std::endl;
+			return;
+		}
+	}
 
 	// Global grid bounds (slightly padded)
 	Eigen::RowVector3d Vmin = { xmin - 0.1, ymin - 0.1, zmin - 0.1 };
@@ -170,8 +370,31 @@ void generate(const std::string& input_path, const std::string& output_path)
 
 	// Write 80-byte header with metadata
 	char header[80] = {};
-	snprintf(header, 80, "type=%d res=%.4g thick=%.4g cells=%.4g",
-	         tpms_input, resolution, thickness, n_cells);
+	if (tpms_type == kSteppedOmega) {
+		// Build zone tuples string: (n,t,cycles) for each zone
+		std::string zones_str;
+		for (size_t i = 0; i < stepped_params.zones.size(); i++) {
+			const auto& z = stepped_params.zones[i];
+			double n = z.omega * max_dim / (2.0 * M_PI);
+			char buf[40];
+			if (i + 1 < stepped_params.zones.size()) {
+				double prev_bd = (i == 0) ? 0.0 : stepped_params.zones[i-1].boundary_d;
+				double cycles = (z.boundary_d - prev_bd) / (2.0 * M_PI / z.omega);
+				snprintf(buf, sizeof(buf), "(%.4g,%.4g,%.4g)", n, z.thickness, cycles);
+			} else {
+				snprintf(buf, sizeof(buf), "(%.4g,%.4g,0)", n, z.thickness);
+			}
+			zones_str += buf;
+		}
+		snprintf(header, 80, "type=3 base=%d res=%.4g %s",
+		         (int)stepped_params.base_type, resolution, zones_str.c_str());
+	} else if (tpms_type == kInterpolatedOmega) {
+		snprintf(header, 80, "type=4 base=%d res=%.4g %s",
+		         (int)interp_params.base_type, resolution, cp_path.c_str());
+	} else {
+		snprintf(header, 80, "type=%d res=%.4g thick=%.4g cells=%.4g",
+		         tpms_input, resolution, thickness, n_cells);
+	}
 	fwrite(header, 1, 80, stl_fp);
 	// Write placeholder triangle count (will patch later)
 	uint32_t total_triangles = 0;
@@ -231,19 +454,65 @@ void generate(const std::string& input_path, const std::string& output_path)
 					const double z = sub_grid(i, 2);
 					Point q(x, y, z);
 
-					double f = tpms_function(tpms_type, omega, x, y, z);
-					double phi_tpms = std::abs(f) - half_t;
-
+					// Compute signed distance to boundary mesh
 					Point closest = tree.closest_point(q);
 					double unsigned_d = std::sqrt(CGAL::squared_distance(q, closest));
 					CGAL::Bounded_side side = inside(q);
 					double d = (side == CGAL::ON_BOUNDED_SIDE) ? unsigned_d : -unsigned_d;
 
+					double phi_tpms, local_smf;
+
+					if (tpms_type == kSteppedOmega) {
+						// Find the two zones that bracket this distance
+						int idx_a, idx_b;
+						double alpha;
+						stepped_find_zones(d, stepped_params, idx_a, idx_b, alpha);
+
+						const auto& za = stepped_params.zones[idx_a];
+						double fa = tpms_function(stepped_params.base_type, za.omega, x, y, z);
+						double hta = (za.thickness / 2.0) * za.omega;
+						double phi_a = std::abs(fa) - hta;
+
+						if (idx_a == idx_b) {
+							// Fully inside one zone
+							phi_tpms = phi_a;
+							local_smf = (2.0 * M_PI / za.omega) / 10.0;
+						} else {
+							// Blending between two zones
+							const auto& zb = stepped_params.zones[idx_b];
+							double fb = tpms_function(stepped_params.base_type, zb.omega, x, y, z);
+							double htb = (zb.thickness / 2.0) * zb.omega;
+							double phi_b = std::abs(fb) - htb;
+
+							phi_tpms = alpha * phi_a + (1.0 - alpha) * phi_b;
+
+							double local_omega = alpha * za.omega + (1.0 - alpha) * zb.omega;
+							local_smf = (2.0 * M_PI / local_omega) / 10.0;
+						}
+
+					} else if (tpms_type == kInterpolatedOmega) {
+						auto [local_omega, local_thick] = idw_interpolate(x, y, z, interp_params.points, max_dim);
+						double local_half_t = (local_thick / 2.0) * local_omega;
+						double f = tpms_function(interp_params.base_type, local_omega, x, y, z);
+						phi_tpms = std::abs(f) - local_half_t;
+						local_smf = (2.0 * M_PI / local_omega) / 10.0;
+
+					} else {
+						// Standard kP/kD/kG
+						double f = tpms_function(tpms_type, omega, x, y, z);
+						phi_tpms = std::abs(f) - half_t;
+						local_smf = smf;
+					}
+
 					double phi;
-					if (d < -3.0 * smf) {
+					if (d < -3.0 * local_smf) {
 						phi = 1000.0;
 					} else {
-						phi = smf * std::log(std::exp(phi_tpms / smf) + std::exp(-d / smf));
+						// Log-sum-exp trick to avoid overflow
+						double a = phi_tpms / local_smf;
+						double b = -d / local_smf;
+						double m = std::max(a, b);
+						phi = local_smf * (m + std::log(std::exp(a - m) + std::exp(b - m)));
 					}
 
 					sub_B(i) = phi;
@@ -296,4 +565,4 @@ int main(int argc, char** argv)
 	return 0;
 }
 
-// [-1,1] models input: 0 (kP), 100 (resolution), 0.1 (thickness), 3 (n_cells)
+// [-1,1] models input: 0 (kP), 100 (resolution), 0.1 (thickness), 3 (n_cells) / 3-stepped, 0-kp, 150-res, (8,0.05,2), (5,0.1,0)
