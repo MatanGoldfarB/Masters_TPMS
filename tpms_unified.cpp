@@ -7,6 +7,7 @@
 #include <CGAL/AABB_face_graph_triangle_primitive.h>
 #include <CGAL/bounding_box.h>
 #include <CGAL/Polygon_mesh_processing/polygon_mesh_to_polygon_soup.h>
+#include <CGAL/Heat_method_3/Surface_mesh_geodesic_distances_3.h>
 
 #include <igl/copyleft/marching_cubes.h>
 
@@ -27,7 +28,9 @@ typedef CGAL::AABB_face_graph_triangle_primitive<SurfaceMesh> Primitive;
 typedef CGAL::AABB_traits_3<K, Primitive> AABB_traits;
 typedef CGAL::AABB_tree<AABB_traits> Tree;
 
-enum TpmsType { kP = 0, kD = 1, kG = 2, kSteppedOmega = 3, kInterpolatedOmega = 4 };
+enum TpmsType { kP = 0, kD = 1, kG = 2, kSteppedOmega = 3, kInterpolatedOmega = 4, kGeodesicOmega = 5 };
+
+enum DecayType { kSuperGaussian = 0, kRational = 1 };
 
 struct SteppedZone {
 	double omega;
@@ -50,6 +53,160 @@ struct InterpolatedOmegaParams {
 	TpmsType base_type;
 	std::vector<ControlPoint> points;
 };
+
+struct GeodesicOmegaParams {
+	TpmsType base_type;
+	DecayType decay_type;
+	double decay_power;          // exponent p (default 3.0)
+	double wavelength_scale;     // scale s in decay formula (default 1.0)
+	std::vector<ControlPoint> points;
+	// Per-vertex precomputed values (indexed by mesh vertex descriptor)
+	std::vector<double> vertex_omega;
+	std::vector<double> vertex_thickness;
+	std::vector<Eigen::Vector3d> vertex_positions;  // cached for fast inner-loop iteration
+};
+
+// Decay function: returns a factor in [0,1] that multiplies the surface frequency.
+// d = distance from surface, lambda = local wavelength (2*pi/omega), p = decay power, s = wavelength scale.
+// SuperGaussian: exp(-(d/(s*lambda))^p)  — slow near surface, steep far away
+// Rational:      1 / (1 + (d/(s*lambda))^p)
+static double decay_factor(double d, double lambda, DecayType type, double p, double s)
+{
+	if (d <= 0.0) return 1.0;
+	double r = d / (s * lambda);
+	switch (type) {
+	case kSuperGaussian:
+		return std::exp(-std::pow(r, p));
+	case kRational:
+		return 1.0 / (1.0 + std::pow(r, p));
+	}
+	return 1.0;
+}
+
+// Snap a 3D point to the nearest vertex of the mesh.
+// Uses AABB tree to find closest point on surface, then picks the nearest vertex of that face.
+static SurfaceMesh::Vertex_index snap_to_nearest_vertex(
+	const SurfaceMesh& mesh, const Tree& tree,
+	double px, double py, double pz)
+{
+	Point q(px, py, pz);
+	auto loc = tree.closest_point_and_primitive(q);
+	// loc.second is a face_descriptor iterator
+	auto fd = loc.second;
+
+	// Find the closest vertex among this face's vertices
+	double best_dist2 = std::numeric_limits<double>::max();
+	SurfaceMesh::Vertex_index best_vi;
+	for (auto vi : mesh.vertices_around_face(mesh.halfedge(fd))) {
+		const Point& vp = mesh.point(vi);
+		double dx = vp.x() - px, dy = vp.y() - py, dz = vp.z() - pz;
+		double d2 = dx*dx + dy*dy + dz*dz;
+		if (d2 < best_dist2) {
+			best_dist2 = d2;
+			best_vi = vi;
+		}
+	}
+	return best_vi;
+}
+
+// Precompute per-vertex omega and thickness using geodesic IDW interpolation.
+// Uses CGAL Heat Method to compute geodesic distances from each control point vertex,
+// then IDW-blends at every mesh vertex.
+static void precompute_geodesic_vertex_fields(
+	SurfaceMesh& mesh, const Tree& tree,
+	GeodesicOmegaParams& params, double max_dim)
+{
+	size_t nv = mesh.number_of_vertices();
+	size_t ncp = params.points.size();
+
+	std::cout << "  Precomputing geodesic distances (" << ncp << " sources, "
+	          << nv << " vertices)..." << std::endl;
+
+	// Snap control points to nearest vertices
+	std::vector<SurfaceMesh::Vertex_index> source_verts(ncp);
+	std::vector<double> cp_omega(ncp), cp_thickness(ncp);
+	for (size_t i = 0; i < ncp; i++) {
+		const auto& cp = params.points[i];
+		source_verts[i] = snap_to_nearest_vertex(mesh, tree, cp.x, cp.y, cp.z);
+		cp_omega[i] = cp.n_cells * 2.0 * M_PI / max_dim;
+		cp_thickness[i] = cp.thickness;
+		const Point& sp = mesh.point(source_verts[i]);
+		std::cout << "    CP " << i << ": n_cells=" << cp.n_cells
+		          << " snapped to vertex " << source_verts[i]
+		          << " (" << sp.x() << ", " << sp.y() << ", " << sp.z() << ")" << std::endl;
+	}
+
+	// Create vertex property map for geodesic distances
+	typedef SurfaceMesh::Property_map<SurfaceMesh::Vertex_index, double> Vertex_distance_map;
+
+	// Build the Heat Method object (prefactorizes Laplacian — done once)
+	typedef CGAL::Heat_method_3::Surface_mesh_geodesic_distances_3<SurfaceMesh> Heat_method;
+	Heat_method heat(mesh);
+
+	// For each control point, compute geodesic distances to all vertices
+	// Store as ncp vectors of size nv
+	std::vector<std::vector<double>> geo_dists(ncp, std::vector<double>(nv, 0.0));
+
+	for (size_t ci = 0; ci < ncp; ci++) {
+		// Add the source vertex and compute
+		Vertex_distance_map dist_map;
+		bool created;
+		std::string pname = "v:geodist_" + std::to_string(ci);
+		std::tie(dist_map, created) = mesh.add_property_map<SurfaceMesh::Vertex_index, double>(pname, 0.0);
+
+		heat.clear_sources();
+		heat.add_source(source_verts[ci]);
+		heat.estimate_geodesic_distances(dist_map);
+
+		// Copy to our array
+		for (auto vi : mesh.vertices()) {
+			geo_dists[ci][(size_t)vi] = dist_map[vi];
+		}
+
+		// Remove temporary property map
+		mesh.remove_property_map(dist_map);
+
+		std::cout << "    Heat solve " << (ci+1) << "/" << ncp << " done" << std::endl;
+	}
+
+	// IDW interpolation at each vertex using geodesic distances
+	params.vertex_omega.resize(nv);
+	params.vertex_thickness.resize(nv);
+
+	for (auto vi : mesh.vertices()) {
+		size_t vidx = (size_t)vi;
+		double w_sum = 0.0, omega_sum = 0.0, thick_sum = 0.0;
+		bool exact_hit = false;
+
+		for (size_t ci = 0; ci < ncp; ci++) {
+			double gd = geo_dists[ci][vidx];
+			if (gd < 1e-12) {
+				// This vertex IS the control point
+				params.vertex_omega[vidx] = cp_omega[ci];
+				params.vertex_thickness[vidx] = cp_thickness[ci];
+				exact_hit = true;
+				break;
+			}
+			double w = 1.0 / (gd * gd);
+			omega_sum += w * cp_omega[ci];
+			thick_sum += w * cp_thickness[ci];
+			w_sum += w;
+		}
+		if (!exact_hit) {
+			params.vertex_omega[vidx] = omega_sum / w_sum;
+			params.vertex_thickness[vidx] = thick_sum / w_sum;
+		}
+	}
+
+	// Cache vertex positions for fast inner-loop access
+	params.vertex_positions.resize(nv);
+	for (auto vi : mesh.vertices()) {
+		const Point& vp = mesh.point(vi);
+		params.vertex_positions[(size_t)vi] = Eigen::Vector3d(vp.x(), vp.y(), vp.z());
+	}
+
+	std::cout << "  Geodesic vertex field precomputation complete." << std::endl;
+}
 
 // Smooth interpolation [0,1] with zero derivative at endpoints
 static double smoothstep(double edge0, double edge1, double x)
@@ -218,10 +375,10 @@ void generate(const std::string& input_path, const std::string& output_path)
 	std::cout << "  Z: [" << zmin << ", " << zmax << "]  (" << zgap << ")" << std::endl;
 
 	// --- Interactive parameters ---
-	std::cout << "Input TPMS type (0=kP, 1=kD, 2=kG, 3=SteppedOmega, 4=InterpolatedOmega): ";
+	std::cout << "Input TPMS type (0=kP, 1=kD, 2=kG, 3=SteppedOmega, 4=InterpolatedOmega, 5=GeodesicOmega): ";
 	int tpms_input;
 	std::cin >> tpms_input;
-	if (tpms_input < 0 || tpms_input > 4) {
+	if (tpms_input < 0 || tpms_input > 5) {
 		std::cerr << "Error: invalid TPMS type" << std::endl;
 		return;
 	}
@@ -230,10 +387,11 @@ void generate(const std::string& input_path, const std::string& output_path)
 	// Parameters for new types (populated below if needed)
 	SteppedOmegaParams stepped_params = {};
 	InterpolatedOmegaParams interp_params = {};
+	GeodesicOmegaParams geodesic_params = {};
 
-	// Base type for stepped/interpolated modes
+	// Base type for stepped/interpolated/geodesic modes
 	TpmsType base_type = tpms_type;  // for kP/kD/kG, base_type == tpms_type
-	if (tpms_type == kSteppedOmega || tpms_type == kInterpolatedOmega) {
+	if (tpms_type == kSteppedOmega || tpms_type == kInterpolatedOmega || tpms_type == kGeodesicOmega) {
 		std::cout << "Input base TPMS type (0=kP, 1=kD, 2=kG): ";
 		int base_input;
 		std::cin >> base_input;
@@ -340,6 +498,39 @@ void generate(const std::string& input_path, const std::string& output_path)
 		}
 	}
 
+	// --- Geodesic omega: load control points, compute geodesic surface field ---
+	if (tpms_type == kGeodesicOmega) {
+		geodesic_params.base_type = base_type;
+
+		std::cout << "Input control points file path: ";
+		std::cin >> cp_path;
+		geodesic_params.points = parse_control_points(cp_path);
+		if (geodesic_params.points.empty()) {
+			std::cerr << "Error: no control points loaded" << std::endl;
+			return;
+		}
+
+		std::cout << "Input decay type (0=SuperGaussian, 1=Rational) [default 0]: ";
+		int decay_input;
+		std::cin >> decay_input;
+		geodesic_params.decay_type = (decay_input == 1) ? kRational : kSuperGaussian;
+
+		std::cout << "Input decay power p (e.g. 3.0 = slow near surface, steep far) [default 3]: ";
+		std::cin >> geodesic_params.decay_power;
+		if (geodesic_params.decay_power <= 0.0) geodesic_params.decay_power = 3.0;
+
+		std::cout << "Input wavelength scale s (how many wavelengths before significant decay) [default 1]: ";
+		std::cin >> geodesic_params.wavelength_scale;
+		if (geodesic_params.wavelength_scale <= 0.0) geodesic_params.wavelength_scale = 1.0;
+
+		std::cout << "  Decay: " << (geodesic_params.decay_type == kSuperGaussian ? "SuperGaussian" : "Rational")
+		          << ", p=" << geodesic_params.decay_power
+		          << ", s=" << geodesic_params.wavelength_scale << std::endl;
+
+		// Precompute per-vertex omega and thickness using Heat Method geodesic distances
+		precompute_geodesic_vertex_fields(mesh, tree, geodesic_params, max_dim);
+	}
+
 	// Global grid bounds (slightly padded)
 	Eigen::RowVector3d Vmin = { xmin - 0.1, ymin - 0.1, zmin - 0.1 };
 	Eigen::RowVector3d Vmax = { xmax + 0.1, ymax + 0.1, zmax + 0.1 };
@@ -391,6 +582,10 @@ void generate(const std::string& input_path, const std::string& output_path)
 	} else if (tpms_type == kInterpolatedOmega) {
 		snprintf(header, 80, "type=4 base=%d res=%.4g %s",
 		         (int)interp_params.base_type, resolution, cp_path.c_str());
+	} else if (tpms_type == kGeodesicOmega) {
+		snprintf(header, 80, "type=5 base=%d res=%.4g p=%.2g s=%.2g",
+		         (int)geodesic_params.base_type, resolution,
+		         geodesic_params.decay_power, geodesic_params.wavelength_scale);
 	} else {
 		snprintf(header, 80, "type=%d res=%.4g thick=%.4g cells=%.4g",
 		         tpms_input, resolution, thickness, n_cells);
@@ -455,7 +650,9 @@ void generate(const std::string& input_path, const std::string& output_path)
 					Point q(x, y, z);
 
 					// Compute signed distance to boundary mesh
-					Point closest = tree.closest_point(q);
+					auto cp_and_prim = tree.closest_point_and_primitive(q);
+					Point closest = cp_and_prim.first;
+					auto closest_face = cp_and_prim.second;
 					double unsigned_d = std::sqrt(CGAL::squared_distance(q, closest));
 					CGAL::Bounded_side side = inside(q);
 					double d = (side == CGAL::ON_BOUNDED_SIDE) ? unsigned_d : -unsigned_d;
@@ -496,6 +693,50 @@ void generate(const std::string& input_path, const std::string& output_path)
 						double f = tpms_function(interp_params.base_type, local_omega, x, y, z);
 						phi_tpms = std::abs(f) - local_half_t;
 						local_smf = (2.0 * M_PI / local_omega) / 10.0;
+
+					} else if (tpms_type == kGeodesicOmega) {
+						// Smooth volumetric IDW from all mesh vertices.
+						// Avoids medial-axis discontinuity that closest-face projection causes.
+						size_t nv = geodesic_params.vertex_positions.size();
+						double w_sum = 0.0, omega_sum = 0.0, thick_sum = 0.0;
+						for (size_t vi = 0; vi < nv; vi++) {
+							const Eigen::Vector3d& vp = geodesic_params.vertex_positions[vi];
+							double dx = x - vp.x(), dy = y - vp.y(), dz = z - vp.z();
+							double dist2 = dx*dx + dy*dy + dz*dz;
+							if (dist2 < 1e-12) {
+								w_sum = 1.0;
+								omega_sum = geodesic_params.vertex_omega[vi];
+								thick_sum = geodesic_params.vertex_thickness[vi];
+								break;
+							}
+							double w = 1.0 / dist2;
+							omega_sum += w * geodesic_params.vertex_omega[vi];
+							thick_sum += w * geodesic_params.vertex_thickness[vi];
+							w_sum += w;
+						}
+						double omega_surf = omega_sum / w_sum;
+						double thick_surf = thick_sum / w_sum;
+
+						// Apply decay based on distance from surface
+						double lambda = 2.0 * M_PI / omega_surf;
+						double df = decay_factor(unsigned_d, lambda,
+							geodesic_params.decay_type, geodesic_params.decay_power,
+							geodesic_params.wavelength_scale);
+						double local_omega = omega_surf * df;
+						double local_thick = thick_surf;  // thickness stays constant (larger cells = thicker walls)
+
+						// Clamp omega to avoid degenerate zero-frequency
+						double min_omega = 0.01;
+						if (local_omega < min_omega) {
+							// Deep interior — effectively no TPMS, force exterior
+							phi_tpms = 1000.0;
+							local_smf = 1.0;
+						} else {
+							double local_half_t = (local_thick / 2.0) * local_omega;
+							double f = tpms_function(geodesic_params.base_type, local_omega, x, y, z);
+							phi_tpms = std::abs(f) - local_half_t;
+							local_smf = (2.0 * M_PI / local_omega) / 10.0;
+						}
 
 					} else {
 						// Standard kP/kD/kG
@@ -566,3 +807,4 @@ int main(int argc, char** argv)
 }
 
 // [-1,1] models input: 0 (kP), 100 (resolution), 0.1 (thickness), 3 (n_cells) / 3-stepped, 0-kp, 150-res, (8,0.05,2), (5,0.1,0)
+// 5-geodesic, 0-kP, 50-res, control_points_geodesic_test.txt, 0-SuperGaussian, 3-power, 1-scale
