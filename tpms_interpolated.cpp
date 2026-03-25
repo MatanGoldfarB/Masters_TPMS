@@ -15,6 +15,9 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <Eigen/Geometry>
 
 typedef CGAL::Simple_cartesian<double> Kernel;
@@ -121,8 +124,17 @@ void generate(const std::string& input_path, const std::string& cp_path,
 		return;
 	}
 
-	// Inside test
-	CGAL::Side_of_triangle_mesh<SurfaceMesh, K> inside(mesh);
+	// Inside test — one instance per thread for thread safety
+#ifdef _OPENMP
+	int max_threads = omp_get_max_threads();
+#else
+	int max_threads = 1;
+#endif
+	std::vector<CGAL::Side_of_triangle_mesh<SurfaceMesh, K>> inside_queries;
+	inside_queries.reserve(max_threads);
+	for (int t = 0; t < max_threads; t++) {
+		inside_queries.emplace_back(mesh);
+	}
 
 	// AABB tree for distance queries
 	Tree tree(faces(mesh).first, faces(mesh).second, mesh);
@@ -160,9 +172,10 @@ void generate(const std::string& input_path, const std::string& cp_path,
 	std::cout << "  Grid: " << x_num << " x " << y_num << " x " << z_num
 	          << " = " << (long long)x_num * y_num * z_num << " voxels" << std::endl;
 
-	// Global grid bounds (slightly padded)
-	Eigen::RowVector3d Vmin = { xmin - 0.1, ymin - 0.1, zmin - 0.1 };
-	Eigen::RowVector3d Vmax = { xmax + 0.1, ymax + 0.1, zmax + 0.1 };
+	// Global grid bounds (padded proportionally to mesh size)
+	double pad = 0.01 * max_dim;
+	Eigen::RowVector3d Vmin = { xmin - pad, ymin - pad, zmin - pad };
+	Eigen::RowVector3d Vmax = { xmax + pad, ymax + pad, zmax + pad };
 
 	const auto lerp_global = [&](int idx, int axis, int total) -> double {
 		return Vmin(axis) + (double)idx / (double)(total - 1) * (Vmax(axis) - Vmin(axis));
@@ -247,8 +260,13 @@ void generate(const std::string& input_path, const std::string& cp_path,
 					auto cp_and_prim = tree.closest_point_and_primitive(q);
 					Point closest = cp_and_prim.first;
 					double unsigned_d = std::sqrt(CGAL::squared_distance(q, closest));
-					CGAL::Bounded_side side = inside(q);
-					double d = (side == CGAL::ON_BOUNDED_SIDE) ? unsigned_d : -unsigned_d;
+					#ifdef _OPENMP
+						int tid = omp_get_thread_num();
+					#else
+						int tid = 0;
+					#endif
+					CGAL::Bounded_side side = inside_queries[tid](q);
+					double d = (side != CGAL::ON_UNBOUNDED_SIDE) ? unsigned_d : -unsigned_d;
 
 					auto [local_omega, local_thick] = idw_interpolate(x, y, z, control_points, max_dim);
 					double local_half_t = (local_thick / 2.0) * local_omega;
