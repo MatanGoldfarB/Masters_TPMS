@@ -205,6 +205,28 @@ static void precompute_geodesic_vertex_fields(
 		params.vertex_positions[(size_t)vi] = Eigen::Vector3d(vp.x(), vp.y(), vp.z());
 	}
 
+	// Subsample if mesh is large — IDW is dominated by nearby vertices,
+	// so ~2000 spatially distributed points give a virtually identical field.
+	const size_t MAX_IDW_VERTS = 2000;
+	if (nv > MAX_IDW_VERTS) {
+		size_t stride = nv / MAX_IDW_VERTS;
+		std::vector<double> sub_omega, sub_thick;
+		std::vector<Eigen::Vector3d> sub_pos;
+		sub_omega.reserve(MAX_IDW_VERTS + 1);
+		sub_thick.reserve(MAX_IDW_VERTS + 1);
+		sub_pos.reserve(MAX_IDW_VERTS + 1);
+		for (size_t i = 0; i < nv; i += stride) {
+			sub_omega.push_back(params.vertex_omega[i]);
+			sub_thick.push_back(params.vertex_thickness[i]);
+			sub_pos.push_back(params.vertex_positions[i]);
+		}
+		params.vertex_omega = std::move(sub_omega);
+		params.vertex_thickness = std::move(sub_thick);
+		params.vertex_positions = std::move(sub_pos);
+		std::cout << "  Subsampled " << nv << " -> " << params.vertex_positions.size()
+		          << " vertices for IDW (stride " << stride << ")" << std::endl;
+	}
+
 	std::cout << "  Geodesic vertex field precomputation complete." << std::endl;
 }
 

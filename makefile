@@ -14,7 +14,7 @@ else
   OMP_LDFLAGS = -fopenmp
 endif
 
-TARGETS = tpms_thickness tpms_boundary tpms_matan tpms_unified visualize_inout
+TARGETS = tpms_thickness tpms_boundary tpms_matan tpms_unified tpms_interpolated visualize_inout
 
 all: $(TARGETS)
 
@@ -28,6 +28,9 @@ tpms_matan: TPMS_matan.cpp
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
 
 tpms_unified: tpms_unified.cpp
+	$(CXX) $(CXXFLAGS) $(OMP_CXXFLAGS) $< -o $@ $(LDFLAGS) $(OMP_LDFLAGS)
+
+tpms_interpolated: tpms_interpolated.cpp
 	$(CXX) $(CXXFLAGS) $(OMP_CXXFLAGS) $< -o $@ $(LDFLAGS) $(OMP_LDFLAGS)
 
 visualize_inout: visualize_inout.cpp
